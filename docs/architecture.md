@@ -1,223 +1,148 @@
-# Архитектура WhatsApp-рассылки
+# 🗺️ Полная схема Telegram-бота WhatsApp-рассылки
+
+---
 
 ## 1. Компоненты
 ```mermaid
-graph TB
-    subgraph "External Services"
-        TG[Telegram API]
-        WAPPI[Wappi API<br/>WhatsApp Gateway]
-        ROBO[Robokassa<br/>Payment Gateway]
-    end
-
-    subgraph "Docker Stack work_auto_REV"
-        subgraph "Bot Service"
-            BOT[Telegram Bot<br/>aiogram]
-            HANDLERS[Handlers<br/>- Navigation<br/>- Mailing<br/>- Groups<br/>- Images<br/>- Subscription]
-            FSM[FSM States]
-        end
-
-        subgraph "Task Runner Service"
-            RUNNER[Task Runner<br/>asyncio]
-            PROCESSOR[Task Processor]
-            HEALTH[Health Check]
-        end
-
-        subgraph "Data Layer"
-            REDIS[(Redis<br/>- Task Queue<br/>- Locks<br/>- Cache<br/>- Cancellation Flags)]
-            SQLITE[(SQLite<br/>users.db)]
-        end
-    end
-
-    subgraph "CI/CD"
-        GHA[GitHub Actions]
-        DOCKER[Docker Registry]
-    end
-
-    %% User interactions
-    USER((User)) --> TG
-    TG --> BOT
-    BOT --> HANDLERS
-    HANDLERS --> FSM
-
-    %% Data flow
-    HANDLERS --> SQLITE
-    HANDLERS --> REDIS
-
-    %% Task processing
-    HANDLERS -->|Queue Task| REDIS
-    RUNNER -->|Poll Queue| REDIS
-    RUNNER --> PROCESSOR
-    PROCESSOR -->|Send Messages| WAPPI
-    WAPPI -->|Deliver| WA((WhatsApp Groups))
-
-    %% Payment flow
-    HANDLERS -->|Generate Link| ROBO
-    ROBO -->|Webhook| BOT
-    BOT -->|Update Subscription| SQLITE
-
-    %% Health monitoring
-    RUNNER --> HEALTH
-    HEALTH -->|Update Status| REDIS
-
-    %% CI/CD flow
-    GHA -->|Build & Push| DOCKER
-    GHA -->|Deploy| BOT
-    GHA -->|Deploy| RUNNER
-
-    classDef service fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    classDef storage fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef external fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef user fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
-
-    class BOT,RUNNER,HANDLERS,FSM,PROCESSOR,HEALTH service
-    class REDIS,SQLITE storage
-    class TG,WAPPI,ROBO,GHA,DOCKER external
-    class USER,WA user
-
-sequenceDiagram
-    participant U as User
-    participant B as Bot
-    participant R as Redis
-    participant TR as Task Runner
-    participant W as Wappi API
-    participant WG as WhatsApp Groups
-
-    U->>B: /start
-    B->>B: Check registration
-    B->>U: Main menu
-
-    U->>B: 🚀 Start mailing
-    B->>B: Validate subscription
-    B->>B: Prepare task data
-    B->>R: Queue task<br/>(mailing_tasks_queue)
-    B->>R: Save task data<br/>(mailing_task_data:*)
-    B->>U: ✅ Mailing started
-
-    loop Task Processing
-        TR->>R: BLPOP queue
-        R-->>TR: Task ID
-        TR->>R: Get task data
-        TR->>R: Set lock<br/>(mailing_lock_user_id)
-        
-        loop For each group
-            TR->>R: Check cancellation flag
-            alt Not cancelled
-                TR->>W: Send text/image
-                W->>WG: Deliver message
-                W-->>TR: Success/Failure
-            else Cancelled
-                TR->>R: Clean up
-                TR-->>U: ⚠️ Mailing cancelled
-            end
-        end
-        
-        TR->>R: Release lock
-        TR->>R: Delete task data
-        TR->>B: Update keyboard
-        TR-->>U: ✅ Mailing completed
-    end
-
 flowchart TB
-    subgraph "Zero-Downtime Deployment"
-        START([New Release]) --> BUILD[Build Image<br/>work_auto_SHA]
-        BUILD --> CHECK{Active<br/>Tasks?}
-        
-        CHECK -->|No| DEPLOY[Deploy All Services]
-        CHECK -->|Yes| SPLIT[Deploy Bot Only]
-        
-        SPLIT --> BOT_NEW[New Bot<br/>Running]
-        SPLIT --> TR_OLD[Old Task Runner<br/>Continues]
-        
-        TR_OLD --> MONITOR[Monitor Tasks]
-        MONITOR --> WAIT{Tasks<br/>Complete?}
-        WAIT -->|No| MONITOR
-        WAIT -->|Yes| UPDATE[Update Task Runner]
-        
-        UPDATE --> TR_NEW[New Task Runner<br/>Running]
-        
-        DEPLOY --> DONE([Deployment Complete])
-        BOT_NEW --> DONE
-        TR_NEW --> DONE
-        
-        subgraph "Old Stack"
-            OLD_BOT[Old Bot<br/>Stopped]
-            OLD_TR[Old Task Runner<br/>Graceful Shutdown]
-        end
-        
-        subgraph "New Stack"
-            NEW_BOT[New Bot<br/>Active]
-            NEW_TR[New Task Runner<br/>Active]
-        end
+%% ---------- Стили узлов ----------
+classDef svc   fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#01579b;
+classDef prc   fill:#fffde7,stroke:#f9a825,stroke-width:1px,color:#6d4c41;
+classDef store fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20;
+classDef ext   fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#4a148c;
+classDef ci    fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#003c8f;
+classDef mid   fill:#ede7f6,stroke:#512da8,stroke-width:1px,color:#311b92;
+classDef fsm   fill:#fff3e0,stroke:#ef6c00,stroke-width:1px,color:#bf360c;
+
+%% ---------- (0) Легенда ----------
+subgraph "Legend (click to expand)"
+    direction LR
+    L1[Service]:::svc --> L2[Process]:::prc --> L3[(Storage)]:::store --> L4[External]:::ext --> L5[CI/CD]:::ci --> L6[Middleware]:::mid --> L7[State]:::fsm
+end
+
+%% ---------- (1) CI/CD ----------
+subgraph "CI-Pipeline"
+    direction LR
+    ci_lint["Lint & Ruff"]:::ci --> ci_test["PyTest"]:::ci --> ci_build["Docker Build"]:::ci --> ci_push["Push image"]:::ci --> ci_deploy["SSH Deploy"]:::ci
+end
+docker_reg[(Docker Registry)]:::ext
+ci_push -- image --> docker_reg
+ci_deploy -- pull --> docker_reg
+ci_deploy -- exec --> deploy_sh[[deploy.sh]]:::prc
+
+%% ---------- (2) Docker-Stack ----------
+subgraph "Docker-Stack work_auto_$REV"
+    direction TB
+
+    subgraph "Network : appnet"
+        redis_srv[(redis:7)]:::svc
+        volume_redis[(redis_data)]:::store
+        redis_srv -- persists --> volume_redis
     end
 
-stateDiagram-v2
-    [*] --> Idle
-    
-    Idle --> Registration: /start (new user)
-    Idle --> MainMenu: /start (registered)
-    
-    Registration --> EnterToken: Enter credentials
-    EnterToken --> EnterProfileID
-    EnterProfileID --> MainMenu: Save user
-    
-    MainMenu --> MailingData: 📬 Mailing Data
-    MainMenu --> StartMailing: 🚀 Start Mailing
-    MainMenu --> Subscription: 💎 Subscription
-    
-    MailingData --> EditText: 📝 Change Text
-    MailingData --> EditImages: 🖼️ Change Images
-    MailingData --> EditGroups: 👥 Change Groups
-    
-    EditText --> InputText: Enter text
-    InputText --> MailingData: Save
-    
-    EditImages --> UploadImages: Upload photos
-    UploadImages --> CreateCollage: 🌅 Create collage
-    CreateCollage --> MailingData: Save
-    
-    EditGroups --> InputGroups: Enter groups
-    InputGroups --> MailingData: Save
-    
-    StartMailing --> ConfirmMailing: Show preview
-    ConfirmMailing --> TaskQueued: ✅ Yes
-    ConfirmMailing --> MainMenu: ❌ No
-    
-    TaskQueued --> Processing: Task Runner
-    Processing --> Completed: Success
-    Processing --> Cancelled: User cancelled
-    Processing --> Failed: Error
-    
-    Completed --> MainMenu
-    Cancelled --> MainMenu
-    Failed --> MainMenu
-    
-    Subscription --> Payment: 💳 Pay
-    Payment --> CheckPayment: Robokassa
-    CheckPayment --> Subscription: Update status
+    subgraph "Service : bot"
+        bot_ctr[bot container]:::svc
+    end
 
-graph LR
-    subgraph "Resource Limits & Throttling"
-        GLOBAL[Global Rate Limit<br/>1 msg/sec]
-        LOCAL[Local Burst Limit<br/>12 msg/2sec per chat]
-        BACKOFF[429 Backoff<br/>Retry-After]
+    subgraph "Service : task_runner"
+        runner_ctr[task_runner container]:::svc
     end
-    
-    subgraph "Data Storage"
-        subgraph "Redis Keys"
-            QUEUE[mailing_tasks_queue]
-            TASK[mailing_task_data:*]
-            LOCK[mailing_lock_*]
-            CANCEL[cancel_mailing_*]
-            HEALTH[task_runner_health]
-            DUP[dup:profile:run:group:sha]
-            RATE[wappi_rate:*]
-            BACKOFF_KEY[wappi_backoff:*]
-        end
-        
-        subgraph "SQLite Tables"
-            USERS[users<br/>- user_id<br/>- instance<br/>- token<br/>- subscription]
-            GROUPS[groups<br/>- user_id<br/>- group_name]
-            TEXTS[texts<br/>- user_id<br/>- text_message]
-            IMAGES[images<br/>- user_id<br/>- image_data]
-        end
-    end
+
+    backup[backup cron]:::svc
+
+    volume_data[(bind ./data)]:::store
+    bot_ctr -- bind --> volume_data
+    runner_ctr -- bind --> volume_data
+    backup   -- bind --> volume_data
+
+    bot_ctr -->|depends_on| redis_srv
+    runner_ctr -->|depends_on| redis_srv
+end
+
+%% ---------- (3) Bot runtime ----------
+bot_ctr --> run_bot["run_bot.py"]:::prc
+run_bot --> dispatcher["Aiogram Dispatcher"]:::prc
+dispatcher --> mid_maint[MaintenanceMW]:::mid
+dispatcher --> mid_album[AlbumMW]:::mid
+run_bot --> robokassa_srv["Robokassa Webhook"]:::prc
+run_bot --> task_mgr[AsyncTaskManager]:::prc
+run_bot --> redis_fsm[RedisStorage]:::prc
+
+subgraph "Handlers"
+    direction LR
+    h_nav[navigation]:::prc
+    h_admin[admin]:::prc
+    h_user[user_data]:::prc
+    h_text[text]:::prc
+    h_images[images]:::prc
+    h_groups[groups]:::prc
+    h_mail[mailing]:::prc
+    h_sub[subscription]:::prc
+    h_misc[misc]:::prc
+end
+dispatcher --> h_nav & h_admin & h_user & h_text & h_images & h_groups & h_mail & h_sub & h_misc
+
+%% ---------- (3.1) FSM ----------
+subgraph "FSM (StatesGroup)"
+    direction LR
+    st_token[new_token]:::fsm
+    st_profile[new_profile_id]:::fsm
+    st_text[text]:::fsm
+    st_groups_new[groups_input]:::fsm
+    st_groups_add[add_groups_input]:::fsm
+    st_images[images_input]:::fsm
+    st_confirm[confirm_mailing]:::fsm
+end
+h_user --> st_token & st_profile
+h_text --> st_text
+h_groups --> st_groups_new & st_groups_add
+h_images --> st_images
+h_mail --> st_confirm
+
+%% ---------- (4) task_runner runtime ----------
+runner_ctr --> runner_main[task_runner.py]:::prc
+runner_main --> blpop[BLPOP mailing_tasks_queue]:::prc
+runner_main --> health_tick[Health Ping]:::prc
+blpop --> mailing_task[async_tasks.mailing_task]:::prc
+mailing_task --> run_core[core.run_core]:::prc
+
+subgraph "run_core()"
+    direction LR
+    db_layer[DataBaseInteraction]:::prc
+    wap_client[WappiApiClient]:::prc
+    hb_lock[AsyncHeartbeatLock]:::prc
+    helper_antidup[antidup.py]:::prc
+end
+run_core --> db_layer & wap_client & hb_lock & helper_antidup
+wap_client --> WappiAPI[(Wappi API)]:::ext
+
+%% ---------- (5) Хранилища ----------
+redis_srv -.-> queue[mailing_tasks_queue]:::store
+redis_srv -.-> lock_keys[mailing_lock_*]:::store
+redis_srv -.-> cancel_keys[cancel_mailing_*]:::store
+redis_srv -.-> health_key[task_runner_health]:::store
+db_layer <--> sqlite_db[(SQLite users.db)]:::store
+backup -- dump --> dumps[(users.db.dumpYYYYMMDD)]:::store
+
+%% ---------- (6) Оплата ----------
+h_sub -- generate_link --> robokassa_client[RobokassaClient]:::prc
+robokassa_client --> Robokassa[(Robokassa)]:::ext
+Robokassa -- Result_URL --> robokassa_srv
+robokassa_srv --> db_layer
+
+%% ---------- (7) Внешние сервисы ----------
+bot_ctr -- poll/send --> TG_API[(Telegram API)]:::ext
+TG_API -- msgs --> end_users((End Users)):::ext
+WappiAPI -- deliver --> WhatsApp((WhatsApp Groups)):::ext
+
+%% ---------- (8) Ops-скрипты ----------
+monitor_sh[[monitor.sh]]:::prc --> redis_srv
+diagnose_sh[[diagnose-runner.sh]]:::prc --> runner_ctr
+clean_old_sh[[clean_old_stacks.sh]]:::prc --> docker_reg
+deploy_sh --> clean_old_sh & monitor_sh & diagnose_sh
+helper_logging[logging_utils]:::prc --> log_file[(debug.log)]:::store
+
+%% ---------- Node-классы ----------
+class bot_ctr,runner_ctr,backup svc
+class redis_srv,queue,lock_keys,cancel_keys,health_key,sqlite_db,volume_redis,volume_data,dumps store
+class docker_reg,TG_API,WappiAPI,Robokassa,WhatsApp ext

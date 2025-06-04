@@ -146,3 +146,49 @@ helper_logging[logging_utils]:::prc --> log_file[(debug.log)]:::store
 class bot_ctr,runner_ctr,backup svc
 class redis_srv,queue,lock_keys,cancel_keys,health_key,sqlite_db,volume_redis,volume_data,dumps store
 class docker_reg,TG_API,WappiAPI,Robokassa,WhatsApp ext
+```
+
+## 2. Диаграмма последовательностей
+```mermaid
+sequenceDiagram
+    participant U  as User
+    participant B  as Bot
+    participant R  as Redis
+    participant TR as Task&nbsp;Runner
+    participant W  as Wappi&nbsp;API
+    participant WG as WhatsApp&nbsp;Groups
+
+    U->>B: /start
+    B->>B: Check registration
+    B-->>U: Main menu
+
+    U->>B: 🚀 Start mailing
+    B->>B: Validate subscription
+    B->>B: Prepare task data
+    B->>R: RPUSH mailing_tasks_queue
+    B->>R: HSET mailing_task_data:*
+    B-->>U: ✅ Mailing started
+
+    loop Task Processing
+        TR->>R: BLPOP queue
+        R-->>TR: Task ID
+        TR->>R: HGET task data
+        TR->>R: SETEX mailing_lock_user_id
+
+        loop per group
+            TR->>R: GET cancel flag?
+            alt Not cancelled
+                TR->>W: send text/image
+                W->>WG: deliver
+                W-->>TR: ok/fail
+            else Cancelled
+                TR->>R: cleanup keys
+                TR-->>U: ⚠️ cancelled
+            end
+        end
+
+        TR->>R: DEL lock & task
+        TR->>B: update keyboard
+        TR-->>U: ✅ completed
+    end
+```
